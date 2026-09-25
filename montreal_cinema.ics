@@ -1,0 +1,10 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Montreal Cinema Showtime Aggregator//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+X-WR-CALDESC:Current-day movie showtimes for seven Montreal cinemas aggreg
+ ated from Cinoche.
+X-WR-CALNAME:Montreal Cinema Showtimes
+X-WR-TIMEZONE:America/Toronto
+END:VCALENDAR
