@@ -1,774 +1,328 @@
-#!/usr/bin/env python3
-
-"""
-Montreal Cinema Showtime Aggregator
-
-Scrapes current-day showtimes from Cinoche for seven Montreal cinemas
-and generates an iCalendar feed at:
-
-    montreal_cinema.ics
-
-The scraper is intentionally defensive:
-- Uses a realistic browser User-Agent.
-- Retries transient HTTP failures.
-- Supports canonical Cinoche URL fallbacks.
-- Parses server-rendered HTML with BeautifulSoup.
-- Handles multiple languages/formats per movie.
-- Generates stable event UIDs.
-- Uses America/Toronto for all local times.
-- Refuses to replace the existing ICS file if every venue fails.
-"""
-
-from __future__ import annotations
-
-import hashlib
-import logging
 import re
-import sys
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Optional
 from urllib.parse import urljoin
 
-import pytz
 import requests
-from bs4 import BeautifulSoup, Tag
+import pytz
+from bs4 import BeautifulSoup
 from icalendar import Calendar, Event
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
+TIMEZONE = pytz.timezone("America/Toronto")
 OUTPUT_FILE = Path("montreal_cinema.ics")
-TIMEZONE_NAME = "America/Toronto"
-LOCAL_TZ = pytz.timezone(TIMEZONE_NAME)
-
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/153.0.0.0 Safari/537.36"
-)
-
-REQUEST_TIMEOUT = (10, 30)
 
 HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/153.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+    "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
 }
 
-# These are the URLs requested by the project, followed by canonical
-# Cinoche URLs where Cinoche currently uses a different slug.
 VENUES = [
     {
         "name": "Cinéma du Parc",
         "url": "https://www.cinoche.com/cinemas/cinema-du-parc",
-        "fallback_urls": [],
     },
     {
         "name": "Cinéma du Musée",
-        "url": "https://www.cinoche.com/cinemas/cinema-du-musee",
-        "fallback_urls": [
-            "https://www.cinoche.com/cinemas/cinemadumusee",
-        ],
+        "url": "https://www.cinoche.com/cinemas/cinemadumusee",
     },
     {
         "name": "Cinéma Moderne",
-        "url": "https://www.cinoche.com/cinemas/cinema-moderne",
-        "fallback_urls": [
-            "https://www.cinoche.com/cinemas/cinemamoderne",
-        ],
+        "url": "https://www.cinoche.com/cinemas/cinemamoderne",
     },
     {
         "name": "Cineplex Forum",
-        "url": "https://www.cinoche.com/cinemas/cineplex-cinemas-forum",
-        "fallback_urls": [
-            "https://www.cinoche.com/cinemas/amc-forum-22",
-        ],
+        "url": "https://www.cinoche.com/cinemas/amc-forum-22",
     },
     {
         "name": "Cineplex Banque Scotia",
-        "url": (
-            "https://www.cinoche.com/cinemas/"
-            "cineplex-cinemas-banque-scotia-montreal"
-        ),
-        "fallback_urls": [
-            "https://www.cinoche.com/cinemas/cinema-banque-scotia",
-        ],
+        "url": "https://www.cinoche.com/cinemas/cinema-banque-scotia",
     },
     {
         "name": "Cineplex Quartier Latin",
-        "url": (
-            "https://www.cinoche.com/cinemas/"
-            "cineplex-odeon-quartier-latin"
-        ),
-        "fallback_urls": [
-            "https://www.cinoche.com/cinemas/quartier-latin",
-        ],
+        "url": "https://www.cinoche.com/cinemas/quartier-latin",
     },
     {
         "name": "La Cinémathèque québécoise",
-        "url": (
-            "https://www.cinoche.com/cinemas/"
-            "cinematheque-quebecoise"
-        ),
-        "fallback_urls": [],
+        "url": "https://www.cinoche.com/cinemas/cinematheque-quebecoise",
     },
 ]
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+LANGUAGE_RE = re.compile(
+    r"^(V\.O\.|V\.F\.|V\.A\.|V\.O\.A\.|V\.O\.F\.|V\.O\.JAP\.|"
+    r"V\.O\.COR\.|V\.O\.HINDI\.|V\.O\.PUNJABI\.|V\.O\.CHIN\.|"
+    r"V\.O\.HARY\.|V\.O\.INNUE\.|V\.O\.INTER\.|V\.O\.ES\.|"
+    r"V\.O\.F\.S\.|V\.O\.A\.S\.|V\.O\.COR\.S\.|V\.O\.HINDI\.S\.|"
+    r"V\.O\.PUNJABI\.S\.|V\.O\.JAP\.S\.|V\.O\.CHIN\.S\.|"
+    r"V\.O\.HARY\.S\.|V\.O\.INNUE\.S\.|V\.O\.INTER\.S\.|"
+    r"V\.A\.S\.|V\.F\.S\.)",
+    re.IGNORECASE,
 )
 
-logger = logging.getLogger("montreal-cinema")
 
-
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Showtime:
-    venue: str
-    movie: str
-    language: str
-    show_date: date
-    show_time: time
-    source_url: str
-
-
-# ---------------------------------------------------------------------------
-# HTTP session
-# ---------------------------------------------------------------------------
-
-def build_session() -> requests.Session:
-    """
-    Build a requests Session with automatic retries for transient failures.
-    """
+def make_session():
     session = requests.Session()
 
     retry = Retry(
-        total=4,
-        connect=4,
-        read=4,
-        status=4,
-        backoff_factor=1.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        respect_retry_after_header=True,
-        raise_on_status=False,
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
     )
 
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=10,
-        pool_maxsize=10,
-    )
-
+    adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
     session.headers.update(HEADERS)
 
     return session
 
 
-# ---------------------------------------------------------------------------
-# Text / parsing helpers
-# ---------------------------------------------------------------------------
-
-TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
-
-MONTHS = {
-    # French
-    "janvier": 1,
-    "février": 2,
-    "fevrier": 2,
-    "mars": 3,
-    "avril": 4,
-    "mai": 5,
-    "juin": 6,
-    "juillet": 7,
-    "août": 8,
-    "aout": 8,
-    "septembre": 9,
-    "octobre": 10,
-    "novembre": 11,
-    "décembre": 12,
-    "decembre": 12,
-
-    # English
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
-}
-
-DATE_RE = re.compile(
-    r"^\s*(\d{1,2})\s+([A-Za-zÀ-ÿ]+)"
-    r"(?:\s+\([^)]*\))?\s*$",
-    re.IGNORECASE,
-)
-
-LANGUAGE_RE = re.compile(
-    r"""
-    (?:
-        \bV\s*\.?\s*O\s*\.?
-        |
-        \bV\s*\.?\s*F\s*\.?
-        |
-        \bVOA\b
-        |
-        \bVOF\b
-        |
-        \bVOSTFR\b
-        |
-        \bVOSTA\b
-        |
-        \bVOST\b
-        |
-        \bVersion\s+originale\b
-        |
-        \bVersion\s+en\b
-        |
-        \bEnglish\s+Subtitles\b
-        |
-        \bFrench\s+Subtitles\b
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
+def clean_text(text):
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def normalize_space(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
+def is_language(text):
+    text = clean_text(text)
+    return bool(LANGUAGE_RE.match(text))
 
 
-def extract_times(value: str) -> list[str]:
-    """
-    Cinoche can render adjacent times as:
+def normalize_language(text):
+    text = clean_text(text)
 
-        13:2015:3018:40
-
-    so we intentionally do not require word boundaries around HH:MM.
-    """
-    return TIME_RE.findall(value)
-
-
-def is_language_text(value: str) -> bool:
-    return bool(LANGUAGE_RE.search(value))
-
-
-def normalize_language(raw: str) -> str:
-    """
-    Convert Cinoche's verbose language labels into compact calendar labels.
-
-    Examples:
-        V.O.A. -> VOA
-        V.O.F. -> VOF
-        V.O.A.S.-T.F. -> VOSTFR
-        V.O.F.S.-T.A. -> VOF + English Subtitles
-    """
-    text = normalize_space(raw)
     upper = text.upper()
 
-    # More specific combinations must be checked before generic V.O.A./V.O.F.
-    if "V.O.A.S.-T.F." in upper or "VOA.S.-T.F." in upper:
-        return "VOSTFR"
+    if "SOUS-TITRES EN FRANÇAIS" in upper:
+        if "COR" in upper:
+            return "Coréen, STFR"
+        if "JAP" in upper:
+            return "Japonais, STFR"
+        if "HINDI" in upper:
+            return "Hindi, STFR"
+        if "PUNJABI" in upper:
+            return "Punjabi, STFR"
+        if "HARY" in upper:
+            return "Haryanvi, STFR"
+        if "INNUE" in upper:
+            return "Innu, STFR"
+        if "INTER" in upper:
+            return "International, STFR"
+        return "VO, STFR"
 
-    if "V.O.A.S.-T.A." in upper or "VOA.S.-T.A." in upper:
-        return "VOA + English Subtitles"
+    if "SOUS-TITRES EN ANGLAIS" in upper:
+        if "COR" in upper:
+            return "Coréen, STAN"
+        if "JAP" in upper:
+            return "Japonais, STAN"
+        if "HINDI" in upper:
+            return "Hindi, STAN"
+        if "PUNJABI" in upper:
+            return "Punjabi, STAN"
+        if "HARY" in upper:
+            return "Haryanvi, STAN"
+        if "CHIN" in upper:
+            return "Chinois, STAN"
+        if "INNUE" in upper:
+            return "Innu, STAN"
+        if "F" in upper:
+            return "VO, STAN"
+        return "VO, STAN"
 
-    if "V.O.F.S.-T.A." in upper or "VOF.S.-T.A." in upper:
-        return "VOF + English Subtitles"
-
-    if "V.O.F.S.-T.F." in upper or "VOF.S.-T.F." in upper:
-        return "VOF + French Subtitles"
-
-    if "V.O.COR.S.-T.A." in upper:
-        return "Korean + English Subtitles"
-
-    if "V.O.COR.S.-T.F." in upper:
-        return "Korean + French Subtitles"
-
-    if "V.O.INNUE.S.-T.F." in upper:
-        return "Innu + French Subtitles"
-
-    if "V.O.INNUE.S.-T.A." in upper:
-        return "Innu + English Subtitles"
-
-    if "V.O.INTER.S.-T.A." in upper:
-        return "International + English Subtitles"
-
-    if "V.O.INTER.S.-T.F." in upper:
-        return "International + French Subtitles"
-
-    if "V.O.A." in upper or re.search(r"\bVOA\b", upper):
-        return "VOA"
-
-    if "V.O.F." in upper or re.search(r"\bVOF\b", upper):
-        return "VOF"
-
-    if "V.F." in upper:
+    if "VERSION EN FRANÇAIS" in upper:
         return "VF"
 
-    if "V.O." in upper:
-        return "VO"
+    if "VERSION EN ANGLAIS" in upper:
+        return "VOA"
 
-    # Generic fallback.
-    cleaned = re.sub(r"\([^)]*\)", "", text)
-    cleaned = normalize_space(cleaned)
+    if "VERSION ORIGINALE EN FRANÇAIS" in upper:
+        return "VOF"
 
-    return cleaned[:100] if cleaned else "Language unspecified"
-
-
-def parse_time(value: str) -> time:
-    hour, minute = map(int, value.split(":"))
-    return time(hour=hour, minute=minute)
+    return text
 
 
-def localized_datetime(
-    show_date: date,
-    show_time: time,
-) -> datetime:
+def get_text_between(start_anchor, end_anchor):
     """
-    Create a timezone-aware America/Toronto datetime.
-
-    pytz.localize() is used rather than assigning tzinfo directly.
+    Returns all visible text between two film links in document order.
     """
-    naive = datetime.combine(show_date, show_time)
-    return LOCAL_TZ.localize(naive, is_dst=None)
+    pieces = []
+
+    for item in start_anchor.next_elements:
+        if item is end_anchor:
+            break
+
+        if hasattr(item, "strip"):
+            value = item.strip()
+            if value:
+                pieces.append(value)
+
+    return pieces
 
 
-# ---------------------------------------------------------------------------
-# Date extraction
-# ---------------------------------------------------------------------------
-
-def extract_schedule_date(
-    soup: BeautifulSoup,
-    today: date,
-) -> date:
+def extract_movies(soup):
     """
-    Find Cinoche's active schedule date.
+    Cinoche's cinema pages are essentially structured like:
 
-    Cinoche exposes date tabs as text such as:
+        Movie title
+        duration
+        genre
+        ...
+        language
+        showtimes
+        language
+        showtimes
+        next movie
 
-        25 septembre (septembre)
-
-    There can also be unrelated dates elsewhere on some pages, so we
-    only accept text nodes that consist entirely of a day + month.
+    We therefore use the film links as boundaries instead of relying
+    on a specific CSS class that can change.
     """
-    candidates: list[date] = []
 
-    for text_node in soup.stripped_strings:
-        text = normalize_space(text_node)
-        match = DATE_RE.match(text)
+    all_links = soup.select('a[href*="/films/"]')
 
-        if not match:
-            continue
+    movie_anchors = []
+    seen_urls = set()
 
-        day = int(match.group(1))
-        month_name = match.group(2).lower()
-
-        if month_name not in MONTHS:
-            continue
-
-        month = MONTHS[month_name]
-
-        for year in (today.year - 1, today.year, today.year + 1):
-            try:
-                candidate = date(year, month, day)
-            except ValueError:
-                continue
-
-            # The active Cinoche schedule should be close to today.
-            if abs((candidate - today).days) <= 10:
-                candidates.append(candidate)
-
-    if not candidates:
-        logger.warning(
-            "Could not determine Cinoche schedule date. "
-            "Falling back to local date %s.",
-            today.isoformat(),
-        )
-        return today
-
-    return min(
-        candidates,
-        key=lambda candidate: abs((candidate - today).days),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Movie-card parsing
-# ---------------------------------------------------------------------------
-
-def get_unique_movie_links(element: Tag) -> set[str]:
-    links = set()
-
-    for anchor in element.select('a[href*="/films/"]'):
+    for anchor in all_links:
         href = anchor.get("href")
-        if href:
-            links.add(href.split("#", 1)[0])
-
-    return links
-
-
-def find_movie_card(title_anchor: Tag) -> Optional[Tag]:
-    """
-    Starting from a movie title link, walk upward until we find the smallest
-    container that appears to represent exactly one movie and contains at
-    least one showtime.
-
-    This deliberately avoids depending on Cinoche's CSS class names, which
-    are more likely to change than the semantic /films/ links.
-    """
-    current: Optional[Tag] = title_anchor
-
-    for _ in range(10):
-        if current is None:
-            break
-
-        if not isinstance(current, Tag):
-            break
-
-        unique_links = get_unique_movie_links(current)
-        text = normalize_space(current.get_text(" ", strip=True))
-        times = extract_times(text)
-
-        if len(unique_links) == 1 and times:
-            return current
-
-        parent = current.parent
-
-        if not isinstance(parent, Tag):
-            break
-
-        current = parent
-
-    return None
-
-
-def extract_movie_title(anchor: Tag) -> str:
-    """
-    Get the visible title from the /films/ anchor.
-
-    Cinoche sometimes has extra nested/duplicated markup around titles, so
-    normalize whitespace and discard obvious UI-only text.
-    """
-    title = normalize_space(anchor.get_text(" ", strip=True))
-
-    title = re.sub(
-        r"^\s*Nouveauté\s+",
-        "",
-        title,
-        flags=re.IGNORECASE,
-    )
-
-    return title
-
-
-def parse_language_showtimes(
-    card: Tag,
-    show_date: date,
-    venue_name: str,
-    movie_title: str,
-    source_url: str,
-) -> list[Showtime]:
-    """
-    Walk text nodes in DOM order.
-
-    Once a language label is encountered, subsequent time strings belong to
-    that language until another language label appears.
-
-    This handles cards such as:
-
-        V.F.
-        12:30 14:50 17:10
-
-        V.O.A.
-        14:15 16:40 19:00
-
-    as well as premium-format variants such as:
-
-        V.O.A. (3D)
-        18:50
-    """
-    events: list[Showtime] = []
-    current_language = "Language unspecified"
-
-    for node in card.stripped_strings:
-        text = normalize_space(node)
-
-        if not text:
+        if not href:
             continue
 
-        if is_language_text(text):
-            current_language = normalize_language(text)
+        full_url = urljoin("https://www.cinoche.com", href)
 
-        times = extract_times(text)
+        title = clean_text(anchor.get_text(" ", strip=True))
 
-        if not times:
+        if not title:
             continue
 
-        for raw_time in times:
-            try:
-                parsed_time = parse_time(raw_time)
-            except ValueError:
-                logger.warning(
-                    "Skipping invalid time %r for %s / %s",
-                    raw_time,
-                    venue_name,
-                    movie_title,
-                )
+        # Cinoche sometimes has a "Nouveauté" link pointing to the
+        # exact same film URL before the actual title.
+        if title.lower() == "nouveauté":
+            continue
+
+        if full_url in seen_urls:
+            continue
+
+        seen_urls.add(full_url)
+        movie_anchors.append((anchor, title, full_url))
+
+    movies = []
+
+    for index, (anchor, title, url) in enumerate(movie_anchors):
+        next_anchor = None
+
+        if index + 1 < len(movie_anchors):
+            next_anchor = movie_anchors[index + 1][0]
+
+        pieces = get_text_between(anchor, next_anchor)
+
+        if not pieces:
+            continue
+
+        # Find language/showtime groups.
+        current_language = None
+        showtimes = []
+
+        for piece in pieces:
+            text = clean_text(piece)
+
+            if not text:
                 continue
 
-            events.append(
-                Showtime(
-                    venue=venue_name,
-                    movie=movie_title,
-                    language=current_language,
-                    show_date=show_date,
-                    show_time=parsed_time,
-                    source_url=source_url,
-                )
-            )
-
-    return events
-
-
-# ---------------------------------------------------------------------------
-# Venue scraping
-# ---------------------------------------------------------------------------
-
-def fetch_soup(
-    session: requests.Session,
-    urls: Iterable[str],
-) -> tuple[BeautifulSoup, str]:
-    """
-    Try the requested URL followed by configured canonical fallbacks.
-    """
-    errors = []
-
-    for url in urls:
-        try:
-            logger.info("Fetching %s", url)
-
-            response = session.get(
-                url,
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            if response.status_code != 200:
-                errors.append(
-                    f"{url}: HTTP {response.status_code}"
-                )
+            if is_language(text):
+                current_language = normalize_language(text)
                 continue
 
-            if not response.text.strip():
-                errors.append(f"{url}: empty response")
-                continue
+            times = TIME_RE.findall(text)
 
-            soup = BeautifulSoup(
-                response.text,
-                "html.parser",
+            if times and current_language:
+                for hour, minute in times:
+                    showtimes.append(
+                        {
+                            "time": f"{int(hour):02d}:{minute}",
+                            "language": current_language,
+                        }
+                    )
+
+        # Remove duplicates while preserving order.
+        unique_showtimes = []
+        seen = set()
+
+        for item in showtimes:
+            key = (item["time"], item["language"])
+
+            if key not in seen:
+                seen.add(key)
+                unique_showtimes.append(item)
+
+        if unique_showtimes:
+            movies.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "showtimes": unique_showtimes,
+                }
             )
 
-            return soup, response.url
-
-        except requests.RequestException as exc:
-            errors.append(f"{url}: {exc}")
-
-    raise RuntimeError(
-        "All URL attempts failed:\n"
-        + "\n".join(f"  - {error}" for error in errors)
-    )
+    return movies
 
 
-def scrape_venue(
-    session: requests.Session,
-    venue: dict,
-    today: date,
-) -> list[Showtime]:
-    urls = [venue["url"], *venue.get("fallback_urls", [])]
+def scrape_venue(session, venue):
+    print(f"\nScraping {venue['name']}...")
+    print(f"URL: {venue['url']}")
 
-    soup, final_url = fetch_soup(session, urls)
+    response = session.get(venue["url"], timeout=30)
+    response.raise_for_status()
 
-    page_date = extract_schedule_date(
-        soup=soup,
-        today=today,
-    )
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    logger.info(
-        "%s: schedule date detected as %s",
-        venue["name"],
-        page_date.isoformat(),
-    )
+    movies = extract_movies(soup)
 
-    title_anchors = soup.select('a[href*="/films/"]')
+    print(f"Found {len(movies)} movies.")
 
-    if not title_anchors:
-        raise RuntimeError(
-            f"{venue['name']}: no movie links found"
-        )
+    total_showtimes = sum(len(movie["showtimes"]) for movie in movies)
+    print(f"Found {total_showtimes} showtimes.")
 
-    events: list[Showtime] = []
-    seen_cards: set[int] = set()
-    seen_events: set[tuple] = set()
+    for movie in movies:
+        print(f"  {movie['title']}")
 
-    for title_anchor in title_anchors:
-        movie_title = extract_movie_title(title_anchor)
-
-        if not movie_title:
-            continue
-
-        card = find_movie_card(title_anchor)
-
-        if card is None:
-            logger.debug(
-                "%s: unable to locate card for %s",
-                venue["name"],
-                movie_title,
-            )
-            continue
-
-        card_identity = id(card)
-
-        if card_identity in seen_cards:
-            continue
-
-        seen_cards.add(card_identity)
-
-        card_events = parse_language_showtimes(
-            card=card,
-            show_date=page_date,
-            venue_name=venue["name"],
-            movie_title=movie_title,
-            source_url=final_url,
-        )
-
-        for event in card_events:
-            key = (
-                event.venue,
-                event.movie,
-                event.language,
-                event.show_date,
-                event.show_time,
+        for showtime in movie["showtimes"]:
+            print(
+                f"    {showtime['time']} "
+                f"({showtime['language']})"
             )
 
-            if key in seen_events:
-                continue
-
-            seen_events.add(key)
-            events.append(event)
-
-    logger.info(
-        "%s: extracted %d showtimes",
-        venue["name"],
-        len(events),
-    )
-
-    return events
+    return movies
 
 
-# ---------------------------------------------------------------------------
-# iCalendar generation
-# ---------------------------------------------------------------------------
-
-def stable_uid(showtime: Showtime) -> str:
-    """
-    Stable UID so calendar clients can update existing events instead of
-    treating each daily scraper run as a completely new set of events.
-    """
-    identity = "|".join(
-        [
-            showtime.venue,
-            showtime.movie,
-            showtime.language,
-            showtime.show_date.isoformat(),
-            showtime.show_time.strftime("%H:%M"),
-        ]
-    )
-
-    digest = hashlib.sha256(
-        identity.encode("utf-8")
-    ).hexdigest()[:24]
-
-    return f"{digest}@montreal-cinema"
-
-
-def build_calendar(events: list[Showtime]) -> Calendar:
+def create_calendar(all_showtimes):
     calendar = Calendar()
 
+    calendar.add("prodid", "-//Montreal Cinema Showtime Aggregator//EN")
+    calendar.add("version", "2.0")
+    calendar.add("calscale", "GREGORIAN")
+    calendar.add("method", "PUBLISH")
     calendar.add(
-        "PRODID",
-        "-//Montreal Cinema Showtime Aggregator//EN",
+        "x-wr-caldesc",
+        "Current-day movie showtimes for seven Montreal cinemas aggregated from Cinoche.",
     )
-    calendar.add(
-        "VERSION",
-        "2.0",
-    )
-    calendar.add(
-        "CALSCALE",
-        "GREGORIAN",
-    )
-    calendar.add(
-        "METHOD",
-        "PUBLISH",
-    )
-    calendar.add(
-        "X-WR-CALNAME",
-        "Montreal Cinema Showtimes",
-    )
-    calendar.add(
-        "X-WR-CALDESC",
-        (
-            "Current-day movie showtimes for seven Montreal cinemas "
-            "aggregated from Cinoche."
-        ),
-    )
-    calendar.add(
-        "X-WR-TIMEZONE",
-        TIMEZONE_NAME,
-    )
+    calendar.add("x-wr-calname", "Montreal Cinema Showtimes")
+    calendar.add("x-wr-timezone", "America/Toronto")
 
-    generated_at = datetime.now(timezone.utc)
-
-    for showtime in sorted(
-        events,
-        key=lambda item: (
-            item.show_date,
-            item.show_time,
-            item.venue,
-            item.movie,
-            item.language,
-        ),
-    ):
-        start = localized_datetime(
-            showtime.show_date,
-            showtime.show_time,
+    for item in all_showtimes:
+        start = TIMEZONE.localize(
+            datetime.combine(
+                item["date"],
+                datetime.strptime(item["time"], "%H:%M").time(),
+            )
         )
 
         end = start + timedelta(hours=2)
@@ -776,182 +330,103 @@ def build_calendar(events: list[Showtime]) -> Calendar:
         event = Event()
 
         event.add(
-            "UID",
-            stable_uid(showtime),
+            "summary",
+            f"[{item['venue']}] {item['title']} ({item['language']})",
         )
 
-        event.add(
-            "DTSTAMP",
-            generated_at,
-        )
+        event.add("dtstart", start)
+        event.add("dtend", end)
+        event.add("location", item["venue"])
 
         event.add(
-            "DTSTART",
-            start,
+            "description",
+            f"Showtime found on Cinoche.com\n{item['url']}",
         )
 
-        event.add(
-            "DTEND",
-            end,
-        )
-
-        event.add(
-            "SUMMARY",
-            (
-                f"[{showtime.venue}] "
-                f"{showtime.movie} "
-                f"({showtime.language})"
-            ),
-        )
-
-        event.add(
-            "LOCATION",
-            showtime.venue,
-        )
-
-        event.add(
-            "DESCRIPTION",
-            (
-                f"Language: {showtime.language}\n"
-                f"Source: {showtime.source_url}"
-            ),
-        )
-
-        event.add(
-            "URL",
-            showtime.source_url,
-        )
+        event.add("uid", item["uid"])
+        event.add("dtstamp", datetime.now(TIMEZONE))
 
         calendar.add_component(event)
 
     return calendar
 
 
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
+def main():
+    today = datetime.now(TIMEZONE).date()
 
-def write_calendar(
-    calendar: Calendar,
-    output_file: Path,
-) -> None:
-    """
-    Write atomically so a failed/interrupted run cannot leave a truncated
-    .ics file behind.
-    """
-    temporary_file = output_file.with_suffix(".ics.tmp")
+    print("=" * 60)
+    print("Montreal Cinema Showtime Aggregator")
+    print("=" * 60)
+    print(f"Date: {today}")
+    print()
 
-    data = calendar.to_ical()
+    session = make_session()
 
-    temporary_file.write_bytes(data)
-
-    temporary_file.replace(output_file)
-
-    logger.info(
-        "Wrote %d bytes to %s",
-        output_file.stat().st_size,
-        output_file,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> int:
-    today = datetime.now(LOCAL_TZ).date()
-
-    logger.info(
-        "Starting Montreal cinema sync for %s",
-        today.isoformat(),
-    )
-
-    session = build_session()
-
-    all_events: list[Showtime] = []
+    all_showtimes = []
     successful_venues = 0
-    failed_venues = 0
 
     for venue in VENUES:
         try:
-            venue_events = scrape_venue(
-                session=session,
-                venue=venue,
-                today=today,
-            )
+            movies = scrape_venue(session, venue)
 
-            successful_venues += 1
-            all_events.extend(venue_events)
+            if movies:
+                successful_venues += 1
+
+            for movie in movies:
+                for showtime in movie["showtimes"]:
+                    uid = (
+                        f"{today.isoformat()}-"
+                        f"{venue['name']}-"
+                        f"{movie['title']}-"
+                        f"{showtime['time']}-"
+                        f"{showtime['language']}"
+                    )
+
+                    all_showtimes.append(
+                        {
+                            "date": today,
+                            "venue": venue["name"],
+                            "title": movie["title"],
+                            "time": showtime["time"],
+                            "language": showtime["language"],
+                            "url": movie["url"],
+                            "uid": uid,
+                        }
+                    )
 
         except Exception as exc:
-            failed_venues += 1
+            print(f"ERROR scraping {venue['name']}: {exc}")
 
-            logger.exception(
-                "Failed to scrape %s: %s",
-                venue["name"],
-                exc,
-            )
+    print()
+    print("=" * 60)
+    print(f"Successful venues: {successful_venues}/{len(VENUES)}")
+    print(f"Total showtimes: {len(all_showtimes)}")
+    print("=" * 60)
 
-    # Do not destroy an existing working feed if Cinoche is temporarily
-    # unavailable or its HTML changes across every venue.
+    # Never overwrite a working calendar with an empty one.
     if successful_venues == 0:
-        logger.error(
-            "Every venue failed. Existing %s was left untouched.",
-            OUTPUT_FILE,
-        )
-        return 1
-
-    # Remove accidental cross-venue duplicates while preserving stable order.
-    unique_events: dict[tuple, Showtime] = {}
-
-    for event in all_events:
-        key = (
-            event.venue,
-            event.movie,
-            event.language,
-            event.show_date,
-            event.show_time,
-        )
-        unique_events[key] = event
-
-    all_events = list(unique_events.values())
-
-    logger.info(
-        "Successful venues: %d/%d",
-        successful_venues,
-        len(VENUES),
-    )
-
-    logger.info(
-        "Failed venues: %d/%d",
-        failed_venues,
-        len(VENUES),
-    )
-
-    logger.info(
-        "Total unique showtimes: %d",
-        len(all_events),
-    )
-
-    # A completely empty calendar from otherwise successful pages can be
-    # legitimate, but log it loudly because it may indicate a parser change.
-    if not all_events:
-        logger.warning(
-            "No showtimes were extracted. "
-            "The generated calendar will be empty."
+        raise RuntimeError(
+            "All cinema scrapes failed. Existing calendar was not replaced."
         )
 
-    calendar = build_calendar(all_events)
+    if not all_showtimes:
+        raise RuntimeError(
+            "The scraper reached Cinoche successfully but found "
+            "zero showtimes. Existing calendar was not replaced."
+        )
 
-    write_calendar(
-        calendar=calendar,
-        output_file=OUTPUT_FILE,
-    )
+    calendar = create_calendar(all_showtimes)
 
-    logger.info("Montreal cinema sync completed successfully.")
+    temp_file = OUTPUT_FILE.with_suffix(".tmp")
 
-    return 0
+    with open(temp_file, "wb") as f:
+        f.write(calendar.to_ical())
+
+    temp_file.replace(OUTPUT_FILE)
+
+    print(f"\nCalendar written to: {OUTPUT_FILE}")
+    print(f"Events written: {len(all_showtimes)}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
